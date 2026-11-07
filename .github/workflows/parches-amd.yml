@@ -6,6 +6,12 @@ name: parches-amd
 #   zortos293/Lichii#432 - min/max/clamp sin NaN (manchas blancas por bloom)
 on:
   workflow_dispatch:
+    inputs:
+      base:
+        description: "frizti = Frizti v3 + #273 + #432 | upstream = zortos293 nx2 + #292 + #432"
+        type: choice
+        options: [frizti, upstream]
+        default: frizti
 
 permissions:
   contents: write
@@ -32,7 +38,14 @@ jobs:
             pull/273/head:refs/remotes/up/pr273 \
             pull/292/head:refs/remotes/up/pr292 \
             pull/432/head:refs/remotes/up/pr432
-          git checkout -B nx2-amd
+          if [ "${{ inputs.base }}" = "upstream" ]; then
+            BRANCH=nx2-amd-upstream
+            git checkout -B "$BRANCH" up/nx2
+          else
+            BRANCH=nx2-amd
+            git checkout -B "$BRANCH"
+          fi
+          echo "BRANCH=$BRANCH" >> "$GITHUB_ENV"
 
           cat > /tmp/resolve_cmake.py <<'PYEOF'
           import os
@@ -97,14 +110,28 @@ jobs:
             echo "::endgroup::"
           }
 
-          pick "#273" "68caa6c75ea6c4db7be2a5988cdbcacf5418d3ed^..68caa6c75ea6c4db7be2a5988cdbcacf5418d3ed"
-          pick "#292" "$(git merge-base up/nx2 up/pr292)..up/pr292"
+          if [ "$BRANCH" = "nx2-amd-upstream" ]; then
+            pick "#292" "$(git merge-base up/nx2 up/pr292)..up/pr292"
+          else
+            pick "#273" "68caa6c75ea6c4db7be2a5988cdbcacf5418d3ed^..68caa6c75ea6c4db7be2a5988cdbcacf5418d3ed"
+          fi
           pick "#432" "$(git merge-base up/nx2 up/pr432)..up/pr432"
 
+          if [ "$BRANCH" = "nx2-amd-upstream" ]; then
+            # El token del flujo no puede subir cambios en .github/workflows: se junta todo en un
+            # commit sobre nx2 que conserva los flujos de este repo.
+            UP_TIP=$(git rev-parse --short HEAD)
+            git reset -q --soft origin/nx2
+            git rm -rq --cached .github
+            rm -rf .github
+            git checkout origin/nx2 -- .github
+            git commit -q -m "zortos293/Lichii nx2 $(git rev-parse --short up/nx2) + #292 + #432 (de $UP_TIP)"
+          fi
+
           git log --oneline -10
-          git push -f origin nx2-amd
+          git push -f origin "$BRANCH"
 
       - name: Lanzar compilacion
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh workflow run release-binaries.yml --repo "$GITHUB_REPOSITORY" --ref nx2-amd -f publish_release=true
+        run: gh workflow run release-binaries.yml --repo "$GITHUB_REPOSITORY" --ref "$BRANCH" -f publish_release=true
