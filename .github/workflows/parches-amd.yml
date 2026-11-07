@@ -99,6 +99,15 @@ jobs:
                   python3 -I /tmp/resolve_cmake.py $conflicts
                   git add $conflicts
                   GIT_EDITOR=true git cherry-pick --continue
+                elif [ "$conflicts" = "src/video_core/pipeline_cache_files.h" ]; then
+                  # Solo choca el numero de version de la cache: se deja el de esta rama + 1 para
+                  # que los shaders guardados se regeneren con el parche.
+                  git checkout --ours -- "$conflicts"
+                  v=$(grep -oP 'VulkanPipelineCacheVersion = \K[0-9]+' "$conflicts")
+                  sed -i "s/VulkanPipelineCacheVersion = $v;/VulkanPipelineCacheVersion = $((v + 1));/" "$conflicts"
+                  echo "   Version de cache Vulkan: $v -> $((v + 1))"
+                  git add "$conflicts"
+                  GIT_EDITOR=true git cherry-pick --continue
                 else
                   echo "::error::Conflicto aplicando $1 ($c):"
                   git diff --name-only --diff-filter=U
