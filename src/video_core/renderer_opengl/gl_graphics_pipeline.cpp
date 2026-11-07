@@ -303,21 +303,24 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
             for (const auto& desc : info.storage_buffers_descriptors) {
                 ASSERT(desc.count == 1);
                 buffer_cache.BindGraphicsStorageBuffer(stage, ssbo_index, desc.cbuf_index,
-                                                       desc.cbuf_offset, desc.is_written);
+                                                       desc.cbuf_offset, desc.is_written,
+                                                       desc.indirect_offset);
                 ++ssbo_index;
             }
         }
         const auto& cbufs{maxwell3d->state.shader_stages[stage].const_buffers};
         const auto read_handle{[&](const auto& desc, u32 index) {
             if (desc.handle_program != ~0U) {
-                // Read by the shader from a storage buffer: computed for this draw.
+                // Read by the shader from a storage buffer: computed for this draw (for an
+                // array, for each element).
                 return TexturePair(VideoCommon::EvaluateTextureHandle(
                                        info, desc.handle_program, *gpu_memory,
                                        [&](u32 cbuf) -> GPUVAddr {
                                            return cbuf < cbufs.size() && cbufs[cbuf].enabled
                                                       ? cbufs[cbuf].address
                                                       : GPUVAddr{};
-                                       }),
+                                       },
+                                       index),
                                    via_header_index);
             }
             ASSERT(cbufs[desc.cbuf_index].enabled);

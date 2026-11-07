@@ -7,6 +7,7 @@
 #pragma once
 
 #include <atomic>
+#include <cstdlib>
 #include <deque>
 #include <limits>
 #include <map>
@@ -46,6 +47,7 @@
 #include "video_core/texture_cache/render_targets.h"
 #include "video_core/texture_cache/types.h"
 #include "video_core/textures/texture.h"
+#include "video_core/textures/unswizzle_worker.h"
 
 namespace Tegra {
 namespace Control {
@@ -144,7 +146,7 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     std::vector<u8> astc_scan_buffer;
     u64 images_deleted{};
     std::map<u64, std::pair<u32, GPUVAddr>> created_shapes;
-    bool debug_stats{true}; ///< Collect what only the debug statistics lines use
+    bool debug_stats{}; ///< Collect what only the debug statistics lines use
 
     static constexpr s64 DEFAULT_EXPECTED_MEMORY = 1_GiB + 125_MiB;
     static constexpr s64 DEFAULT_CRITICAL_MEMORY = 1_GiB + 625_MiB;
@@ -505,6 +507,9 @@ private:
     /// Returns true if the current clear parameters clear the whole image of a given image view
     [[nodiscard]] bool IsFullClear(ImageViewId id);
 
+    /// Returns true if the current clear's render area and scissor cover a width x height image
+    [[nodiscard]] bool ClearCovers(u32 width, u32 height) const;
+
     [[nodiscard]] std::pair<u32, u32> PrepareDmaImage(ImageId dst_id, GPUVAddr base_addr,
                                                       bool mark_as_modified);
 
@@ -552,10 +557,36 @@ private:
     /// Applies EDEN_NX2_TC_EXPECTED_MIB / EDEN_NX2_TC_CRITICAL_MIB and logs the thresholds.
     void ApplyThresholdOverrides(bool log = true);
 
+    /// A GPU-written image dropped without being written back leaves its
+    /// guest memory stale (the GPU's data is gone). Its whole pages are marked here and kept
+    /// tracked, so CPU writes, unmaps and write-backs clear them. An image made entirely on marked
+    /// pages starts without an upload: the upload would only copy stale bytes the GPU overwrites.
+    void MarkStale(const ImageBase& image);
+    void ClearStale(DAddr addr, size_t size);
+    void ClearStaleImage(const ImageBase& image);
+    /// Clears every device range [gpu_addr, gpu_addr + size) maps to.
+    void ClearStaleGpu(GPUVAddr gpu_addr, size_t size);
+    [[nodiscard]] bool IsAllStale(DAddr addr, size_t size) const;
+    void UpdateStaleTracking(u64 run_begin, u64 run_pages, s32 delta);
+    bool tc_skip_stale{[] {
+        const char* value = std::getenv("EDEN_NX2_TC_SKIP_STALE");
+        return value == nullptr || value[0] != '0'; // EDEN_NX2_TC_SKIP_STALE=0: off
+    }()};
+    /// Device memory pages (Core::Memory::YUZU_PAGEBITS), not this cache's 1 MiB lookup pages.
+    static constexpr u64 STALE_PAGE_BITS = 12;
+    std::vector<u64> stale_bits; ///< One bit per device page
+    u64 stale_page_count{};
+    u64 tc_stale_skips{};        ///< Uploads skipped (last 600 frames)
+    u64 tc_stale_skip_bytes{};
+    u64 tc_stale_gpu_written{};  ///< Stale but buffer-written pages: uploaded after all
+
     /// The CPU address an image at gpu_addr is keyed by: its backing, or a fixed stand-in.
     [[nodiscard]] std::optional<DAddr> ImageCpuAddress(GPUVAddr gpu_addr, size_t size) const;
 
     bool has_deleted_images = false;
+    /// True while a clear binds its render targets (UpdateRenderTargets(true)), so JoinImages can
+    /// skip the upload of a new target the clear overwrites whole.
+    bool clearing_render_targets = false;
     bool is_rescaling = false;
     u64 total_used_memory = 0;
     u64 minimum_memory;
@@ -626,6 +657,7 @@ private:
 
     Common::ScratchBuffer<u8> swizzle_data_buffer;
     Common::ScratchBuffer<u8> unswizzle_data_buffer;
+    Tegra::Texture::UnswizzleWorker unswizzle_worker;
 
     u64 modification_tick = 0;
     u64 frame_tick = 0;

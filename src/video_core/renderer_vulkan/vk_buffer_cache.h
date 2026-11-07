@@ -132,6 +132,8 @@ public:
 
     void Finish();
 
+    void FinishForHostRead();
+
     u64 GetDeviceLocalMemory() const;
 
     u64 GetDeviceMemoryUsage() const;
@@ -281,6 +283,10 @@ public:
         return max_dynamic_storage_buffers;
     }
 
+    u32 GetMaxStorageBufferRange() const {
+        return static_cast<u32>(device.GetMaxStorageBufferRange());
+    }
+
 private:
     void BindBuffer(const Buffer& buffer, u32 offset, u32 size) {
         const VkBuffer handle = buffer.Handle();
@@ -321,6 +327,13 @@ private:
 
     bool limit_dynamic_storage_buffers = false;
     u32 max_dynamic_storage_buffers = (std::numeric_limits<u32>::max)();
+
+    /// The index buffer BindIndexBuffer recorded last, at scheduler recording epoch bound_index_epoch.
+    VkBuffer bound_index_buffer = VK_NULL_HANDLE;
+    VkDeviceSize bound_index_offset = 0;
+    VkIndexType bound_index_type = VK_INDEX_TYPE_UINT32;
+    u64 bound_index_epoch = 0;
+    bool bound_index_valid = false;
 };
 
 struct BufferCacheParams {
