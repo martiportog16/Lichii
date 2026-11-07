@@ -1,0 +1,136 @@
+name: amd-94
+
+# Lichii para AMD (RX 9060 XT) sobre zortos293/Lichii build-94 con PRs fijados:
+#   #292 #432 #448 #337 #354 #446 #463 #465 #251 #299  (build-94 ya trae #353 y #418)
+# y lanza release-binaries (solo Windows) sobre la rama amd-94.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  construir:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Descargar codigo
+        uses: actions/checkout@v5
+        with:
+          ref: nx2
+          fetch-depth: 0
+
+      - name: Aplicar receta
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "martiportog16"
+          git config user.email "283288338+martiportog16@users.noreply.github.com"
+          cat > /tmp/receta.sh <<'RECETA'
+          #!/bin/bash
+          # Lichii para AMD (RX 9060 XT) sobre zortos293/Lichii build-94 (222877d) con PRs fijados.
+          # build-94 ya trae #353 (raya violeta) y #418 (fijar hilos GPU).
+          # Uso: receta94.sh <url-del-repo-upstream>
+          set -euo pipefail
+          UP="$1"
+          BASE=222877d4f7c8945b2f31a87b76d09f0a92e4f1b8
+
+          # PR -> commit fijado (cabeza del PR revisada el 2026-11-07).
+          declare -A SHA=(
+            [292]=06c604c9e7d79f98601a6f78de9d4fb91eae3558
+            [432]=4437a12176299f71fe957d21d30ded4b5f9b5261
+            [448]=af501da4b066e5b8c168b4ea795b516655bf82a6
+            [337]=0f0720d07ddeeb52b0f59826b2e79b6b03302ab3
+            [354]=ac07a188be908e17a7624e347f83ae74447a6f2c
+            [446]=be04fb78c3e3da37fe2b9f63e2b76cd8ad4568bd
+            [463]=d9afb52fb6e994d90f552ffbffd086dd16240558
+            [465]=5787498b2a5b48da1d8c1bf043b5bbe23b841715
+            [251]=e965abdde60de440fd03d5be2c5288faa5afe04d
+            [299]=ad6963c420302b88857bc1917c870763f4d4388b
+          )
+
+          git fetch -q --no-tags "$UP" "$BASE" "${SHA[@]}"
+          git checkout -q -B variante "$BASE"
+
+          cat > /tmp/resolve_cmake.py <<'PY'
+          import os
+          import sys
+
+          # Conflictos en listas de archivos de CMakeLists.txt: deja la base y anade las entradas nuevas del
+          # parche solo si el archivo existe en el arbol.
+          for f in sys.argv[1:]:
+              d = os.path.dirname(f)
+              out, ours, theirs, state = [], [], [], None
+              for line in open(f, encoding="utf-8"):
+                  if line.startswith("<<<<<<<"):
+                      state, ours, theirs = "o", [], []
+                      continue
+                  if state and line.startswith("|||||||"):
+                      state = "b"
+                      continue
+                  if state and line.startswith("======="):
+                      state = "t"
+                      continue
+                  if state and line.startswith(">>>>>>>"):
+                      out += ours
+                      seen = {l.strip() for l in ours}
+                      for l in theirs:
+                          t = l.strip()
+                          if t and t not in seen and os.path.exists(os.path.join(d, t)):
+                              out.append(l)
+                      state = None
+                      continue
+                  if state == "o":
+                      ours.append(line)
+                  elif state == "t":
+                      theirs.append(line)
+                  elif state is None:
+                      out.append(line)
+              open(f, "w", encoding="utf-8").write("".join(out))
+              print("resuelto:", f)
+          PY
+
+          # Aplica los commits de un PR uno a uno (conserva su autor original).
+          pick() {
+            local n=$1 head=${SHA[$1]} mb
+            mb=$(git merge-base "$BASE" "$head")
+            echo "::group::#$n"
+            for c in $(git rev-list --reverse --no-merges "$mb..$head"); do
+              echo "-- $(git log -1 --format='%h %s' "$c")"
+              if ! git cherry-pick -x "$c" >/dev/null; then
+                local conflicts
+                conflicts="$(git diff --name-only --diff-filter=U)"
+                if [ -z "$conflicts" ]; then
+                  git cherry-pick --skip
+                elif ! echo "$conflicts" | grep -qv 'CMakeLists.txt$'; then
+                  python3 -I /tmp/resolve_cmake.py $conflicts
+                  git add $conflicts
+                  GIT_EDITOR=true git cherry-pick --continue >/dev/null
+                else
+                  echo "::error::Conflicto en #$n ($c): $(echo $conflicts)"
+                  exit 1
+                fi
+              fi
+            done
+            echo "::endgroup::"
+          }
+
+          for n in 292 432 448 337 354 446 463 465 251 299; do pick $n; done
+          if grep -rlq '^<<<<<<< \|^>>>>>>> ' src/; then echo "::error::quedan marcas de conflicto"; exit 1; fi
+          git log --oneline "$BASE"..HEAD | cat
+          echo "tree $(git rev-parse HEAD^{tree})"
+          RECETA
+          bash /tmp/receta.sh https://github.com/zortos293/Lichii.git
+          # El token del flujo no puede subir cambios en .github/workflows: se junta todo en un
+          # commit sobre nx2 que conserva los flujos de este repo.
+          git reset -q --soft origin/nx2
+          git rm -rq --cached .github
+          rm -rf .github
+          git checkout origin/nx2 -- .github
+          git commit -q -m "Lichii AMD sobre build-94: zortos293/Lichii 222877d + PRs fijados (ver amd-94.yml)"
+          git push -f origin HEAD:refs/heads/amd-94
+
+      - name: Lanzar compilacion
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run release-binaries.yml --repo "$GITHUB_REPOSITORY" --ref amd-94 -f publish_release=true
