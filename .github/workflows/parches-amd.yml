@@ -34,14 +34,58 @@ jobs:
             pull/432/head:refs/remotes/up/pr432
           git checkout -B nx2-amd
 
+          cat > /tmp/resolve_cmake.py <<'PYEOF'
+          import os
+          import sys
+
+          # Resuelve conflictos en listas de archivos de CMakeLists.txt: deja la version de Frizti
+          # y anade las entradas nuevas del parche solo si el archivo existe en el arbol.
+          for f in sys.argv[1:]:
+              d = os.path.dirname(f)
+              out, ours, theirs, state = [], [], [], None
+              for line in open(f, encoding="utf-8"):
+                  if line.startswith("<<<<<<<"):
+                      state, ours, theirs = "o", [], []
+                      continue
+                  if state and line.startswith("|||||||"):
+                      state = "b"
+                      continue
+                  if state and line.startswith("======="):
+                      state = "t"
+                      continue
+                  if state and line.startswith(">>>>>>>"):
+                      out += ours
+                      seen = {l.strip() for l in ours}
+                      for l in theirs:
+                          t = l.strip()
+                          if t and t not in seen and os.path.exists(os.path.join(d, t)):
+                              out.append(l)
+                      state = None
+                      continue
+                  if state == "o":
+                      ours.append(line)
+                  elif state == "t":
+                      theirs.append(line)
+                  elif state is None:
+                      out.append(line)
+              open(f, "w", encoding="utf-8").write("".join(out))
+              print("resuelto:", f)
+          PYEOF
+
           pick() {
             echo "::group::$1"
             for c in $(git rev-list --reverse --no-merges "$2"); do
               echo "-- $(git log -1 --format='%h %s' "$c")"
               if ! git cherry-pick -x "$c"; then
-                if [ -z "$(git diff --name-only --diff-filter=U)" ]; then
+                conflicts="$(git diff --name-only --diff-filter=U)"
+                if [ -z "$conflicts" ]; then
                   echo "   (ya incluido, se omite)"
                   git cherry-pick --skip
+                elif ! echo "$conflicts" | grep -qv 'CMakeLists.txt$'; then
+                  echo "   Resolviendo listas de CMake: $conflicts"
+                  python3 -I /tmp/resolve_cmake.py $conflicts
+                  git add $conflicts
+                  GIT_EDITOR=true git cherry-pick --continue
                 else
                   echo "::error::Conflicto aplicando $1 ($c):"
                   git diff --name-only --diff-filter=U
