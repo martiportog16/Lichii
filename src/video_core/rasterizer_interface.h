@@ -43,6 +43,10 @@ enum class LoadCallbackStage {
 };
 using DiskResourceLoadCallback = std::function<void(LoadCallbackStage, std::size_t, std::size_t)>;
 
+/// Set while the query cache signals the fence that writes a fence-flagged report, so the fence
+/// manager makes that fence even when it is empty (FenceManager::SignalFence).
+inline thread_local bool g_signaling_query_report_fence = false;
+
 class RasterizerInterface {
 public:
     virtual ~RasterizerInterface() = default;
@@ -91,6 +95,11 @@ public:
     /// Release all pending fences.
     virtual void ReleaseFences(bool force = true) = 0;
 
+    /// Writes the region's query reports to guest memory, waiting for pending host results.
+    virtual void FlushQueryResults(DAddr addr, u64 size) {
+        FlushRegion(addr, size, VideoCommon::CacheType::QueryCache);
+    }
+
     /// Notify rasterizer that all caches should be flushed to Switch memory
     virtual void FlushAll() = 0;
 
@@ -116,15 +125,31 @@ public:
     /// Switch 2: the front flushed this command list page with the split drained.
     virtual void NoteGpuWrittenCommandListSynced([[maybe_unused]] DAddr page) {}
 
+    virtual void FlushGpuWrittenCommandListPages(std::span<const DAddr> pages) {
+        for (const DAddr page : pages) {
+            FlushRegion(page, 0x1000, VideoCommon::CacheType::BufferCache);
+        }
+    }
+
     /// Check if the the specified memory area requires flushing to CPU Memory.
     virtual bool MustFlushRegion(DAddr addr, u64 size,
                                  VideoCommon::CacheType which = VideoCommon::CacheType::All) = 0;
 
     virtual RasterizerDownloadArea GetFlushArea(DAddr addr, u64 size) = 0;
 
+    /// Whether reports in the range wait for host query results not yet in guest memory.
+    [[nodiscard]] virtual bool HasPendingQueries([[maybe_unused]] DAddr addr,
+                                                 [[maybe_unused]] u64 size) {
+        return false;
+    }
+
     /// Notify rasterizer that any caches of the specified region should be invalidated
     virtual void InvalidateRegion(DAddr addr, u64 size,
                                   VideoCommon::CacheType which = VideoCommon::CacheType::All) = 0;
+
+    /// Called before guest memory in the region is overwritten, ahead of InvalidateRegion
+    virtual void PrepareRegionWrite([[maybe_unused]] DAddr addr, [[maybe_unused]] u64 size,
+                                    [[maybe_unused]] VideoCommon::CacheType which) {}
 
     virtual void InnerInvalidation(std::span<const std::pair<DAddr, std::size_t>> sequences) {
         if (!Settings::values.skip_cpu_inner_invalidation.GetValue()) {
@@ -136,6 +161,13 @@ public:
 
     /// Notify rasterizer that any caches of the specified region are desync with guest
     virtual void OnCacheInvalidation(PAddr addr, u64 size) = 0;
+
+    /// OnCacheInvalidation for each of the CPU writes InvalidateGPUCache collected.
+    virtual void OnCacheInvalidations(std::span<const std::pair<DAddr, u64>> ranges) {
+        for (const auto& [addr, size] : ranges) {
+            OnCacheInvalidation(addr, size);
+        }
+    }
 
     virtual bool TryCacheInvalidation(DAddr addr, u64 size) {
         if (MustFlushRegion(addr, size, VideoCommon::CacheType::BufferCache)) return false;
