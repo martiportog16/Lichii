@@ -15,6 +15,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <type_traits>
 #include "common/container/unordered_map.h"
@@ -34,6 +35,7 @@
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
+#include "video_core/renderer_vulkan/vk_pipeline_cache_prebuild.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
 #include "video_core/shader_cache.h"
 
@@ -136,14 +138,17 @@ public:
 private:
     [[nodiscard]] GraphicsPipeline* CurrentGraphicsPipelineSlowPath();
 
-    [[nodiscard]] GraphicsPipeline* BuiltPipeline(GraphicsPipeline* pipeline) const noexcept;
+    /// Returns `pipeline` when it is built or its draw must wait for it, nullptr when the draw
+    /// may be skipped while it builds (asynchronous shaders, CanDiscardPendingDraw).
+    [[nodiscard]] GraphicsPipeline* BuiltPipeline(GraphicsPipeline* pipeline) noexcept;
 
     std::unique_ptr<GraphicsPipeline> CreateGraphicsPipeline();
 
     std::unique_ptr<GraphicsPipeline> CreateGraphicsPipeline(
         ShaderPools& pools, const GraphicsPipelineCacheKey& key,
         std::span<Shader::Environment* const> envs, PipelineStatistics* statistics,
-        bool build_in_parallel);
+        bool build_in_parallel, std::shared_ptr<ShaderPools> emit_pools = nullptr,
+        std::unique_ptr<EmissionBudget::Reservation> reservation = nullptr);
 
     ComputePipelineCacheEntry CreateComputePipeline(const ComputePipelineCacheKey& key,
                                                      const ShaderInfo* shader);
@@ -173,6 +178,8 @@ private:
     VideoCore::ShaderNotify& shader_notify;
     bool use_asynchronous_shaders{};
     bool use_vulkan_pipeline_cache{};
+    const size_t num_pipeline_workers;
+    EmissionBudget emission_budget;
 
     GraphicsPipelineCacheKey graphics_key{};
     GraphicsPipeline* current_pipeline{};
@@ -180,6 +187,10 @@ private:
     /// Destroys graphics pipelines unused for a while, once the GPU is done with them.
     void EvictUnusedPipelines();
     u64 frame_count{};
+    /// Wait budget of native draws for unbuilt pipelines left in this frame, in microseconds
+    /// (native_async_draws = Bounded). Only touched on the GPU thread; reset in TickFrame.
+    s64 native_wait_budget_us{8000};
+    s64 native_wait_used_us{}; ///< Budget spent since the last 10 s log line.
     std::deque<std::pair<u64, std::unique_ptr<GraphicsPipeline>>> evicted_pipelines; ///< (tick, pipeline)
     std::unordered_set<u64> used_and_evicted; ///< Key hashes of pipelines used this session, evicted since
 
@@ -187,6 +198,8 @@ private:
     ::Common::unordered_map<GraphicsPipelineCacheKey, std::unique_ptr<GraphicsPipeline>> graphics_cache;
 
     ShaderPools main_pools;
+    std::mutex spare_pools_mutex;
+    std::vector<std::shared_ptr<ShaderPools>> spare_pools;
 
     Shader::Profile profile;
     Shader::HostTranslateInfo host_info;
@@ -213,6 +226,7 @@ private:
     Common::ThreadWorker workers;
     Common::ThreadWorker serialization_thread;
     DynamicFeatures dynamic_features;
+    PipelinePrebuild<GraphicsPipelineCacheKey, GraphicsPipeline> background_pipelines;
 };
 
 } // namespace Vulkan

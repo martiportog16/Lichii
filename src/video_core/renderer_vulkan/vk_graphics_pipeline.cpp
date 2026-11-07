@@ -17,9 +17,11 @@
 #include "video_core/renderer_vulkan/pipeline_helper.h"
 
 #include "common/bit_field.h"
+#include "common/scope_exit.h"
 #include "video_core/renderer_vulkan/maxwell_to_vk.h"
 #include "video_core/renderer_vulkan/pipeline_statistics.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
+#include "video_core/renderer_vulkan/vk_frame_dump.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_render_pass_cache.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -31,6 +33,7 @@
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/gpu_logging/gpu_logging.h"
 #include "common/settings.h"
+#include "shader_recompiler/exception.h"
 #include "video_core/nx2_profile.h"
 
 #if defined(__clang__) && defined(NDEBUG)
@@ -171,10 +174,10 @@ size_t NumAttachments(const FixedPipelineState& state) {
 }
 
 template <typename Spec>
-bool Passes(const std::array<vk::ShaderModule, NUM_STAGES>& modules,
+bool Passes(const std::array<bool, NUM_STAGES>& stages,
             const std::array<Shader::Info, NUM_STAGES>& stage_infos) {
     for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
-        if (!Spec::enabled_stages[stage] && modules[stage]) {
+        if (!Spec::enabled_stages[stage] && stages[stage]) {
             return false;
         }
         const auto& info{stage_infos[stage]};
@@ -205,11 +208,11 @@ bool Passes(const std::array<vk::ShaderModule, NUM_STAGES>& modules,
 using ConfigureFuncPtr = bool (*)(GraphicsPipeline*, bool);
 
 template <typename Spec, typename... Specs>
-ConfigureFuncPtr FindSpec(const std::array<vk::ShaderModule, NUM_STAGES>& modules,
+ConfigureFuncPtr FindSpec(const std::array<bool, NUM_STAGES>& stages,
                           const std::array<Shader::Info, NUM_STAGES>& stage_infos) {
     if constexpr (sizeof...(Specs) > 0) {
-        if (!Passes<Spec>(modules, stage_infos)) {
-            return FindSpec<Specs...>(modules, stage_infos);
+        if (!Passes<Spec>(stages, stage_infos)) {
+            return FindSpec<Specs...>(stages, stage_infos);
         }
     }
     return GraphicsPipeline::MakeConfigureSpecFunc<Spec>();
@@ -255,12 +258,18 @@ struct DefaultSpec {
     static constexpr bool has_images = true;
 };
 
-ConfigureFuncPtr ConfigureFunc(const std::array<vk::ShaderModule, NUM_STAGES>& modules,
+ConfigureFuncPtr ConfigureFunc(const std::array<bool, NUM_STAGES>& stages,
                                const std::array<Shader::Info, NUM_STAGES>& infos) {
     return FindSpec<SimpleVertexSpec, SimpleVertexFragmentSpec, SimpleStorageSpec, SimpleImageSpec,
-                    DefaultSpec>(modules, infos);
+                    DefaultSpec>(stages, infos);
 }
+
+std::atomic<std::chrono::nanoseconds::rep> hold_time_ns{};
 } // Anonymous namespace
+
+std::chrono::nanoseconds GraphicsPipeline::TakeHoldTime() noexcept {
+    return std::chrono::nanoseconds{hold_time_ns.exchange(0, std::memory_order::relaxed)};
+}
 
 // TODO(crueter): This is the worst-formatted code I have EVER seen
 GraphicsPipeline::GraphicsPipeline(
@@ -271,11 +280,13 @@ GraphicsPipeline::GraphicsPipeline(
     Common::ThreadWorker* worker_thread,
     PipelineStatistics* pipeline_statistics, RenderPassCache& render_pass_cache,
     const GraphicsPipelineCacheKey& key_, std::array<vk::ShaderModule, NUM_STAGES> stages,
-    const std::array<const Shader::Info*, NUM_STAGES>& infos)
+    const std::array<const Shader::Info*, NUM_STAGES>& infos,
+    std::function<std::array<vk::ShaderModule, NUM_STAGES>()> emit_stages)
     : key{key_}, device{device_}, texture_cache{texture_cache_}, buffer_cache{buffer_cache_},
       pipeline_cache(pipeline_cache_), scheduler{scheduler_},
       guest_descriptor_queue{guest_descriptor_queue_},
-      descriptor_buffer_ring{descriptor_buffer_ring_}, spv_modules{std::move(stages)} {
+      descriptor_buffer_ring{descriptor_buffer_ring_}, spv_modules{std::move(stages)},
+      worker_only_build{worker_thread && static_cast<bool>(emit_stages)} {
     if (shader_notify) {
         shader_notify->MarkShaderBuilding();
     }
@@ -295,6 +306,12 @@ GraphicsPipeline::GraphicsPipeline(
         num_descriptor_entries += NumDescriptorEntries(*info);
     }
     fragment_has_color0_output = stage_infos[NUM_STAGES - 1].stores_frag_color[0];
+    // The guest leaves render target components the fragment shader doesn't output untouched,
+    // while Vulkan writes undefined values to them (AMD writes garbage), so they are masked out.
+    for (size_t rt = 0; rt < Maxwell::NumRenderTargets; ++rt) {
+        color_output_mask |= u32{stage_infos[NUM_STAGES - 1].frag_color_components[rt]}
+                             << (rt * 4);
+    }
     const auto any_written = [](const auto& descriptors) {
         return std::ranges::any_of(descriptors, [](const auto& desc) { return desc.is_written; });
     };
@@ -332,11 +349,24 @@ GraphicsPipeline::GraphicsPipeline(
         }
     }
 
-    auto func{[this, shader_notify, &render_pass_cache, pipeline_statistics] {
-        const VkRenderPass render_pass{render_pass_cache.Get(MakeRenderPassKey(key.state, device))};
-        Validate();
+    auto func{[this, shader_notify, &render_pass_cache, pipeline_statistics,
+                emit_stages = std::move(emit_stages)] {
+        const auto begin = std::chrono::steady_clock::now();
+        SCOPE_EXIT {
+            if (shader_notify) {
+                shader_notify->MarkShaderComplete();
+            }
+        };
         try {
+            if (emit_stages) {
+                spv_modules = emit_stages();
+            }
+            const VkRenderPass render_pass{render_pass_cache.Get(MakeRenderPassKey(key.state, device))};
+            Validate();
             MakePipeline(render_pass);
+        } catch (const Shader::Exception& exception) {
+            LOG_ERROR(Render_Vulkan, "Graphics pipeline {:016x}: {}", key.Hash(), exception.what());
+            throw;
         } catch (const vk::Exception& exception) {
             LOG_CRITICAL(Render_Vulkan,
                          "Graphics pipeline build failed: {} (stages: tcs={} tes={} geom={}, "
@@ -344,13 +374,7 @@ GraphicsPipeline::GraphicsPipeline(
                          exception.what(), spv_modules[1] ? 1 : 0, spv_modules[2] ? 1 : 0,
                          spv_modules[3] ? 1 : 0, key.state.patch_control_points_minus_one.Value() + 1,
                          device.GetMaxTessellationPatchSize());
-            std::scoped_lock lock{build_mutex};
-            is_built = true;
-            build_condvar.notify_one();
-            if (shader_notify) {
-                shader_notify->MarkShaderComplete();
-            }
-            return;
+            throw;
         }
         if (pipeline_statistics) {
             pipeline_statistics->Collect(device, *pipeline);
@@ -360,32 +384,23 @@ GraphicsPipeline::GraphicsPipeline(
         for (vk::ShaderModule& module : spv_modules) {
             module.reset();
         }
-
-        std::scoped_lock lock{build_mutex};
-        is_built = true;
-        build_condvar.notify_one();
-        if (shader_notify) {
-            shader_notify->MarkShaderComplete();
+        if (worker_only_build) {
+            const auto elapsed = std::chrono::steady_clock::now() - begin;
+            static std::atomic<u32> logged{};
+            if (elapsed > std::chrono::milliseconds{100} ||
+                (elapsed > std::chrono::milliseconds{2} && logged.fetch_add(1) < 400)) {
+                LOG_INFO(Render_Vulkan,
+                         "Nx2Perf async_pipelines: {:016x} worker emission and driver build {:.1f} ms",
+                         key.Hash(), std::chrono::duration<double, std::milli>(elapsed).count());
+            }
         }
     }};
-    // Before the build: it frees the modules this looks at.
-    configure_func = ConfigureFunc(spv_modules, stage_infos);
-    build_task = std::move(func);
-    if (worker_thread) {
-        worker_thread->QueueWork([this] { RunBuild(); });
-    } else {
-        RunBuild();
+    std::array<bool, NUM_STAGES> present_stages{};
+    for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
+        present_stages[stage] = infos[stage] != nullptr;
     }
-}
-
-void GraphicsPipeline::RunBuild() {
-    // A draw or dispatch that needs the pipeline builds it on the scheduler thread instead of
-    // waiting for the worker queue, which can hold hundreds of builds, to reach it.
-    if (build_claimed.exchange(true)) {
-        return;
-    }
-    build_task();
-    build_task = nullptr;
+    configure_func = ConfigureFunc(present_stages, stage_infos);
+    build.emplace(worker_thread, std::move(func));
 }
 
 void GraphicsPipeline::AddTransition(GraphicsPipeline* transition) {
@@ -418,21 +433,20 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
             for (const auto& desc : info.storage_buffers_descriptors) {
                 ASSERT(desc.count == 1);
                 buffer_cache.BindGraphicsStorageBuffer(stage, ssbo_index, desc.cbuf_index,
-                                                       desc.cbuf_offset, desc.is_written);
+                                                       desc.cbuf_offset, desc.is_written,
+                                                       desc.indirect_offset);
                 ++ssbo_index;
             }
         }
         const auto& cbufs{maxwell3d->state.shader_stages[stage].const_buffers};
+        const auto cbuf_address{[&cbufs](u32 cbuf) -> GPUVAddr {
+            return cbuf < cbufs.size() && cbufs[cbuf].enabled ? cbufs[cbuf].address : GPUVAddr{};
+        }};
         const auto read_handle{[&](const auto& desc, u32 index) {
             if (desc.handle_program != ~0U) {
                 // Read by the shader from a storage buffer: computed for this draw.
                 return TexturePair(VideoCommon::EvaluateTextureHandle(
-                                       info, desc.handle_program, *gpu_memory,
-                                       [&](u32 cbuf) -> GPUVAddr {
-                                           return cbuf < cbufs.size() && cbufs[cbuf].enabled
-                                                      ? cbufs[cbuf].address
-                                                      : GPUVAddr{};
-                                       }),
+                                       info, desc.handle_program, *gpu_memory, cbuf_address, index),
                                    via_header_index);
             }
             ASSERT(cbufs[desc.cbuf_index].enabled);
@@ -475,7 +489,36 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                 add_image(desc, false);
             }
         }
+        u32 texture{};
         for (const auto& desc : info.texture_descriptors) {
+            if (desc.count > 1 && desc.handle_program != ~0U) {
+                // A table of handles the shader indexes (one shadow map per light, say), read
+                // in one go; elements repeating a sampler share its lookup.
+                const size_t first{views.size()};
+                u32 last_sampler_index{~0U};
+                VideoCommon::SamplerId sampler{};
+                VideoCommon::EvaluateTextureHandles(
+                    info, desc.handle_program, *gpu_memory, cbuf_address, desc.count,
+                    [&](u32, u32 raw) {
+                        const auto handle{TexturePair(raw, via_header_index)};
+                        views.push_back({handle.first});
+                        if (handle.second != last_sampler_index) {
+                            sampler = texture_cache.GetSamplerId(handle.second, false);
+                            last_sampler_index = handle.second;
+                        }
+                        samplers.push_back(sampler);
+                    });
+                if (VideoCommon::HandleTableNotes::Wanted()) [[unlikely]] {
+                    std::vector<u32> tics(desc.count);
+                    for (u32 index = 0; index < desc.count; ++index) {
+                        tics[index] = views[first + index].index;
+                    }
+                    VideoCommon::HandleTableNotes::Note(key.unique_hashes[stage + 1], texture,
+                                                        tics);
+                }
+                ++texture;
+                continue;
+            }
             for (u32 index = 0; index < desc.count; ++index) {
                 const auto handle{read_handle(desc, index)};
                 views.push_back({handle.first});
@@ -483,6 +526,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                 VideoCommon::SamplerId sampler{texture_cache.GetSamplerId(handle.second, false)};
                 samplers.push_back(sampler);
             }
+            ++texture;
         }
         if constexpr (Spec::has_images) {
             for (const auto& desc : info.image_descriptors) {
@@ -517,13 +561,10 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         texture_cache.FillImageViews(std::span(views.data(), views.size()), false,
                                      Spec::has_images);
     }
-    static const bool record_sampled = [] {
-        const char* const value = std::getenv("EDEN_NX2_FRAME_DUMP_SAMPLED");
-        return value && *value != '\0' && *value != '0';
-    }();
-    if (record_sampled) {
+    if (RecordingSampledTextures()) {
         sampled_images.clear();
         size_t view_index{};
+        size_t sampler_index{};
         for (size_t stage = 0; stage < Spec::enabled_stages.size(); ++stage) {
             if (!Spec::enabled_stages[stage]) {
                 continue;
@@ -536,9 +577,9 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                 view_index += Shader::NumDescriptors(info.image_buffer_descriptors);
             }
             const u32 textures = Shader::NumDescriptors(info.texture_descriptors);
-            for (u32 texture = 0; texture < textures; ++texture, ++view_index) {
-                sampled_images.push_back(
-                    {static_cast<u32>(stage), views[view_index].index, views[view_index].id});
+            for (u32 texture = 0; texture < textures; ++texture, ++view_index, ++sampler_index) {
+                sampled_images.push_back({static_cast<u32>(stage), views[view_index].index,
+                                          views[view_index].id, samplers[sampler_index]});
             }
             if constexpr (Spec::has_images) {
                 view_index += Shader::NumDescriptors(info.image_descriptors);
@@ -686,12 +727,12 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         texture_cache.UpdateRenderTargets(false);
         const std::span<const VideoCommon::ImageViewInOut> view_span{views.data(), views.size()};
         texture_cache.CheckFeedbackLoop(view_span);
-        if (scheduler.TakeFragmentBarrier() &&
+        if (scheduler.HasFragmentBarrier() &&
             (scheduler.RenderPassHasStores() || texture_cache.SamplesRenderTarget(view_span))) {
             scheduler.RequestOutsideRenderPassOperationContext();
         }
     }
-    if (IsBuilt() && !pipeline) {
+    if (IsBuilt() && (!pipeline || build->Failed())) {
         return false;
     }
     Profile::Scope scope{Profile::Zone::ConfigureDraw};
@@ -741,12 +782,15 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
     if (writes_storage) {
         scheduler.NoteRenderPassStores();
     }
-    if (!is_built.load(std::memory_order::relaxed)) {
+    if (!IsBuilt()) {
         // Wait for the pipeline to be built
         scheduler.Record([this](vk::CommandBuffer) {
-            RunBuild();
-            std::unique_lock lock{build_mutex};
-            build_condvar.wait(lock, [this] { return is_built.load(std::memory_order::relaxed); });
+            const auto begin = std::chrono::steady_clock::now();
+            build->Wait(!worker_only_build);
+            hold_time_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                       std::chrono::steady_clock::now() - begin)
+                                       .count(),
+                                   std::memory_order::relaxed);
         });
     }
     const bool is_rescaling{texture_cache.IsRescaling()};
@@ -785,7 +829,8 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
             cmdbuf.BindDescriptorBuffersEXT(binding_info);
         }
         if (bind_pipeline) {
-            if (!pipeline) {
+            scheduler.SetGraphicsPipelineMissing(!pipeline || build->Failed());
+            if (!pipeline || build->Failed()) {
                 return;
             }
             cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, *pipeline);
@@ -1081,6 +1126,7 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
         for (size_t i = 0; i < mask_table.size(); ++i) {
             write_mask |= mask[i] ? mask_table[i] : 0;
         }
+        write_mask &= ColorOutputMask(index);
         cb_attachments.push_back({
             .blendEnable = blend.enable != 0,
             .srcColorBlendFactor = MaxwellToVK::BlendFactor(blend.SourceRGBFactor()),
