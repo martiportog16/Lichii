@@ -1,7 +1,7 @@
 name: amd-94
 
 # Lichii para AMD (RX 9060 XT) sobre zortos293/Lichii build-94 con PRs fijados:
-#   #292 #432 #448 #337 #354 #446 #463 #465 #251 #299  (build-94 ya trae #353 y #418)
+#   #292 #432 #448 #337 #354 #446 #463 #465 #251 #299 #440  (build-94 ya trae #353 y #418)
 # y lanza release-binaries (solo Windows) sobre la rama amd-94.
 on:
   workflow_dispatch:
@@ -47,6 +47,7 @@ jobs:
             [465]=5787498b2a5b48da1d8c1bf043b5bbe23b841715
             [251]=e965abdde60de440fd03d5be2c5288faa5afe04d
             [299]=ad6963c420302b88857bc1917c870763f4d4388b
+            [440]=0ff4f58b04854c3ec9c99ae6d0005ca388081abf
           )
 
           git fetch -q --no-tags "$UP" "$BASE" "${SHA[@]}"
@@ -115,7 +116,7 @@ jobs:
             echo "::endgroup::"
           }
 
-          for n in 292 432 448 337 354 446 463 465 251 299; do pick $n; done
+          for n in 292 432 448 337 354 446 463 465 251 299 440; do pick $n; done
           if grep -rlq '^<<<<<<< \|^>>>>>>> ' src/; then echo "::error::quedan marcas de conflicto"; exit 1; fi
           git log --oneline "$BASE"..HEAD | cat
           echo "tree $(git rev-parse HEAD^{tree})"
