@@ -1,0 +1,66 @@
+name: parches-amd
+
+# Aplica sobre nx2 (Frizti v3) los arreglos de AMD para Ocarina of Time y lanza la compilacion:
+#   zortos293/Lichii#273 - shaders AMD (depth compare, atomics, shuffles)
+#   zortos293/Lichii#292 - limite de table pointers a 256 MiB (niebla/sondas de luz)
+#   zortos293/Lichii#432 - min/max/clamp sin NaN (manchas blancas por bloom)
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  aplicar:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Descargar codigo
+        uses: actions/checkout@v5
+        with:
+          ref: nx2
+          fetch-depth: 0
+
+      - name: Aplicar parches
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "martiportog16"
+          git config user.email "283288338+martiportog16@users.noreply.github.com"
+          git fetch --no-tags https://github.com/zortos293/Lichii.git \
+            nx2:refs/remotes/up/nx2 \
+            pull/273/head:refs/remotes/up/pr273 \
+            pull/292/head:refs/remotes/up/pr292 \
+            pull/432/head:refs/remotes/up/pr432
+          git checkout -B nx2-amd
+
+          pick() {
+            echo "::group::$1"
+            for c in $(git rev-list --reverse --no-merges "$2"); do
+              echo "-- $(git log -1 --format='%h %s' "$c")"
+              if ! git cherry-pick -x "$c"; then
+                if [ -z "$(git diff --name-only --diff-filter=U)" ]; then
+                  echo "   (ya incluido, se omite)"
+                  git cherry-pick --skip
+                else
+                  echo "::error::Conflicto aplicando $1 ($c):"
+                  git diff --name-only --diff-filter=U
+                  git diff | head -200
+                  exit 1
+                fi
+              fi
+            done
+            echo "::endgroup::"
+          }
+
+          pick "#273" "68caa6c75ea6c4db7be2a5988cdbcacf5418d3ed^..68caa6c75ea6c4db7be2a5988cdbcacf5418d3ed"
+          pick "#292" "$(git merge-base up/nx2 up/pr292)..up/pr292"
+          pick "#432" "$(git merge-base up/nx2 up/pr432)..up/pr432"
+
+          git log --oneline -10
+          git push -f origin nx2-amd
+
+      - name: Lanzar compilacion
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run release-binaries.yml --repo "$GITHUB_REPOSITORY" --ref nx2-amd -f publish_release=true
