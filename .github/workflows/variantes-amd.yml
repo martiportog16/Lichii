@@ -1,0 +1,161 @@
+name: variantes-amd
+
+# Construye una version de Lichii para AMD (RX 9060 XT) sobre zortos293/Lichii nx2 con PRs fijados:
+#   estable:      #292 #432 #353 #448 #337 #354 #418 #446 #463 #465 #251 #299
+#   experimental: lo mismo + #345 (lecturas DMA precisas), adaptado a mano
+# y lanza release-binaries (solo Windows) sobre la rama resultante.
+on:
+  workflow_dispatch:
+    inputs:
+      variante:
+        description: "estable o experimental"
+        type: choice
+        options: [estable, experimental]
+        default: estable
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  construir:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Descargar codigo
+        uses: actions/checkout@v5
+        with:
+          ref: nx2
+          fetch-depth: 0
+
+      - name: Aplicar receta
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "martiportog16"
+          git config user.email "283288338+martiportog16@users.noreply.github.com"
+          cat > /tmp/receta.sh <<'RECETA'
+          #!/bin/bash
+          # Construye la variante de Lichii para AMD sobre zortos293/Lichii nx2 con versiones fijas de cada PR.
+          # Uso: receta.sh <estable|experimental> <url-del-repo-upstream>
+          # Deja el resultado en HEAD (rama de trabajo actual) como commits sobre BASE.
+          set -euo pipefail
+          VARIANTE="$1"
+          UP="$2"
+          BASE=9fa4a71fa051aa857e2d8f370aa31739a4f062c2
+
+          # PR -> commit fijado (cabeza del PR revisada el 2026-11-07).
+          declare -A SHA=(
+            [292]=06c604c9e7d79f98601a6f78de9d4fb91eae3558
+            [432]=4437a12176299f71fe957d21d30ded4b5f9b5261
+            [353]=fc731789dcc276f55e1d85e1ad81c32628e6b705
+            [448]=af501da4b066e5b8c168b4ea795b516655bf82a6
+            [337]=0f0720d07ddeeb52b0f59826b2e79b6b03302ab3
+            [354]=ac07a188be908e17a7624e347f83ae74447a6f2c
+            [418]=c5d51c5b335ef8aab444382d2d76cda1f551a3d1
+            [446]=be04fb78c3e3da37fe2b9f63e2b76cd8ad4568bd
+            [463]=d9afb52fb6e994d90f552ffbffd086dd16240558
+            [465]=5787498b2a5b48da1d8c1bf043b5bbe23b841715
+            [251]=e965abdde60de440fd03d5be2c5288faa5afe04d
+            [299]=ad6963c420302b88857bc1917c870763f4d4388b
+            [345]=cc808c195f966b5995564e74170ed3adef908919
+          )
+
+          git fetch -q --no-tags "$UP" nx2 "${SHA[@]}"
+          git checkout -q -B variante "$BASE"
+
+          # Aplica los commits de un PR uno a uno (conserva su autor original).
+          pick() {
+            local n=$1 head=${SHA[$1]} mb
+            mb=$(git merge-base "$BASE" "$head")
+            echo "::group::#$n (cherry-pick)"
+            for c in $(git rev-list --reverse --no-merges "$mb..$head"); do
+              echo "-- $(git log -1 --format='%h %s' "$c")"
+              if ! git cherry-pick -x "$c" >/dev/null; then
+                if [ -z "$(git diff --name-only --diff-filter=U)" ]; then
+                  git cherry-pick --skip
+                else
+                  echo "::error::Conflicto en #$n ($c): $(git diff --name-only --diff-filter=U | tr '\n' ' ')"
+                  exit 1
+                fi
+              fi
+            done
+            echo "::endgroup::"
+          }
+
+          # Aplica el resultado final de un PR como un solo cambio (para PRs con merges internos).
+          squash() {
+            local n=$1 head=${SHA[$1]} mb
+            mb=$(git merge-base "$BASE" "$head")
+            echo "::group::#$n (diff unico)"
+            git diff "$mb" "$head" > "/tmp/pr$n.diff"
+            git apply -3 "/tmp/pr$n.diff" || true
+            echo "::endgroup::"
+          }
+
+          pick 292
+          pick 432
+          squash 353
+          if [ -n "$(git diff --name-only --diff-filter=U)" ]; then echo "::error::#353 con conflictos"; exit 1; fi
+          git commit -q -m "vulkan: don't write render target components the fragment shader doesn't output (zortos293/Lichii#353, jpkto)"
+          for n in 448 337 354 418 446 463 465 251 299; do pick $n; done
+
+          if [ "$VARIANTE" = experimental ]; then
+            squash 345
+            # Conflictos conocidos: el nx2 base ya trae su propio lote de invalidaciones de cache, asi que se
+            # deja el suyo; del #345 se toman las lecturas DMA precisas y la espera acotada de las consultas.
+            python3 - <<'PY'
+          import sys
+          def take(path, side):
+              out, state = [], None
+              for line in open(path, encoding="utf-8"):
+                  if line.startswith("<<<<<<< "):
+                      state = "o"; continue
+                  if state and line.startswith("||||||| "):
+                      state = "b"; continue
+                  if state and line.strip() == "=======":
+                      state = "t"; continue
+                  if state and line.startswith(">>>>>>> "):
+                      state = None; continue
+                  if state is None or (state == "o" and side == "ours") or (state == "t" and side == "theirs"):
+                      out.append(line)
+              open(path, "w", encoding="utf-8").write("".join(out))
+          for p in ["src/video_core/gpu.cpp", "src/video_core/rasterizer_interface.h",
+                    "src/video_core/renderer_vulkan/vk_rasterizer.h"]:
+              take(p, "ours")
+          for p in ["src/video_core/renderer_vulkan/vk_rasterizer.cpp", "src/video_core/engines/maxwell_3d.cpp",
+                    "src/video_core/gpu_thread.cpp"]:
+              take(p, "theirs")
+          p = "src/video_core/renderer_vulkan/vk_rasterizer.cpp"
+          s = open(p, encoding="utf-8").read()
+          start = s.index("void RasterizerVulkan::OnCacheInvalidations(std::span<const std::pair<DAddr, size_t>> ranges) {")
+          end = s.index("bool RasterizerVulkan::TryCacheInvalidation", start)
+          open(p, "w", encoding="utf-8").write(s[:start] + s[end:])
+          p = "src/video_core/gpu_thread.cpp"
+          s = open(p, encoding="utf-8").read()
+          old = "seen_latch, std::chrono::milliseconds{1});"
+          assert s.count(old) == 1
+          open(p, "w", encoding="utf-8").write(s.replace(old, "seen_latch, std::chrono::microseconds{50});"))
+          PY
+            if grep -rlq '^<<<<<<< \|^>>>>>>> ' src/; then echo "::error::quedan marcas de conflicto"; exit 1; fi
+            git add -A
+            git commit -q -m "video_core: precise split-front DMA reads and bounded query waits (zortos293/Lichii#345, celmax85), adaptado a nx2 + #446"
+          fi
+          git log --oneline "$BASE"..HEAD | cat
+          echo "tree $(git rev-parse HEAD^{tree})"
+          RECETA
+          bash /tmp/receta.sh "${{ inputs.variante }}" https://github.com/zortos293/Lichii.git
+          BRANCH="amd-${{ inputs.variante }}"
+          echo "BRANCH=$BRANCH" >> "$GITHUB_ENV"
+          # El token del flujo no puede subir cambios en .github/workflows: se junta todo en un
+          # commit sobre nx2 que conserva los flujos de este repo.
+          git reset -q --soft origin/nx2
+          git rm -rq --cached .github
+          rm -rf .github
+          git checkout origin/nx2 -- .github
+          git commit -q -m "Lichii AMD ${{ inputs.variante }}: zortos293/Lichii nx2 9fa4a71 + PRs fijados (ver variantes-amd.yml)"
+          git push -f origin "HEAD:refs/heads/$BRANCH"
+
+      - name: Lanzar compilacion
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run release-binaries.yml --repo "$GITHUB_REPOSITORY" --ref "$BRANCH" -f publish_release=true
