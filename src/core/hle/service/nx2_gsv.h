@@ -4,6 +4,7 @@
 #pragma once
 
 #include <algorithm>
+#include "common/nx2_timeline.h"
 #include <array>
 #include <thread>
 #include <chrono>
@@ -29,6 +30,7 @@
 #include "common/div_ceil.h"
 #include "common/dkb_frame_trace.h"
 #include "common/game_presets.h"
+#include "common/nx2_movie_clock.h"
 #include "common/settings.h"
 #include "common/thread.h"
 #include "core/core.h"
@@ -39,6 +41,7 @@
 #include "core/frontend/framebuffer_layout.h"
 #include "core/perf_stats.h"
 #include "video_core/gpu.h"
+#include "video_core/nx2_perf.h"
 #include "video_core/framebuffer_config.h"
 #include "core/core_timing.h"
 #include "core/hle/kernel/k_client_session.h"
@@ -1734,6 +1737,8 @@ private:
     // client may acquire next, four zero words. Nothing is shown yet; every slot is handed back
     // at once (changes.patch's default mask is 0x7fff).
     void PresentClientBuffer(HLERequestContext& ctx) {
+        Common::Nx2Timeline::OnPresent();
+        Common::Nx2Timeline::Span timeline_span{"guest present"};
         const auto* w = ctx.CommandBuffer();
         ++m_presents;
         if (Common::DkbFrameTrace::Enabled()) {
@@ -1751,10 +1756,24 @@ private:
         // previous frame's fence instead and let the game prepare frame N+1 meanwhile (waiting
         // for this frame there cost 8-56 ms of every 34-105 ms frame, or never finished).
         // EDEN_NX2_FRAMES_AHEAD=1 always waits for the previous frame, =0 always for this one.
-        static const int frames_ahead = [] {
+        static const int frames_ahead_setting = [] {
             const char* value = std::getenv("EDEN_NX2_FRAMES_AHEAD");
             return value == nullptr ? -1 : value[0] == '1' ? 1 : 0;
         }();
+        // Donkey Kong Bananza's channels wait on each other every frame, so it always ran a frame
+        // ahead, where it rewrote memory the GPU thread hadn't read yet (misread commands, then
+        // a freeze or crash; rubberbanding while moving). Title 1 runs ahead without either.
+        constexpr u64 DonkeyKongBananzaProgramId = 0x040074A01BF12000ULL;
+        // Ocarina waited ~12 ms a frame on its previous frame's fence here (#161).
+        constexpr u64 OcarinaOfTimeProgramId = 0x0400486024DEC000ULL;
+        int frames_ahead = frames_ahead_setting;
+        const u64 app_program_id = system.GetApplicationProcessProgramID();
+        if (frames_ahead == -1 && app_program_id == DonkeyKongBananzaProgramId) {
+            frames_ahead = 0;
+        } else if (frames_ahead == -1 && app_program_id == OcarinaOfTimeProgramId &&
+                   VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::FramesAhead)) {
+            frames_ahead = 1;
+        }
         const auto entered = std::chrono::steady_clock::now();
         if (frames_ahead == 1 || (frames_ahead == -1 && !WaitForFrame(~w[22], w[24], true))) {
             LOG_DEBUG(Service, "nx2:vi2 present #{} fence ({}, {:#x}), waiting for ({}, {:#x}); now {:#x}",
@@ -1782,7 +1801,7 @@ private:
         const auto waited = std::chrono::steady_clock::now();
         Composite(w[5], ~w[22], w[24], w[7]);
         const auto composited = std::chrono::steady_clock::now();
-        PaceToVblank(w[12]);
+        PaceToVblank(w[12], ctx.GetThread().GetOwnerProcess());
         const auto paced = std::chrono::steady_clock::now();
         if (Common::DkbFrameTrace::Enabled()) {
             const auto ms = [](auto duration) {
@@ -1823,6 +1842,11 @@ private:
             m_stats.composite_us += to_us(composited - waited);
             m_stats.pace_us += to_us(paced - composited);
             m_stats.max_fence_us = (std::max<long long>)(m_stats.max_fence_us, static_cast<long long>(to_us(waited - entered)));
+            // Counted at the reply: the game gets its buffers back with this frame unfinished.
+            if (const u32 fence_id = ~w[22]; fence_id < 192 &&
+                !system.Host1x().GetSyncpointManager().IsReadyGuest(fence_id, w[24])) {
+                ++m_stats.ran_ahead;
+            }
             if (m_stats.last_present != std::chrono::steady_clock::time_point{}) {
                 const long long frame = to_us(entered - m_stats.last_present);
                 m_stats.frame_us += frame;
@@ -1834,16 +1858,61 @@ private:
                 LOG_INFO(Service,
                          "nx2:vi2 last 600 presents: frame {} us (max {}, {} over 100 ms), "
                          "blocked on the GPU fence {} us (max {}), composite {} us, vblank "
-                         "pacing {} us",
+                         "pacing {} us, {} ran a frame ahead",
                          m_stats.frame_us / 599, m_stats.max_frame_us, m_stats.hitches,
                          m_stats.fence_us / 600, m_stats.max_fence_us, m_stats.composite_us / 600,
-                         m_stats.pace_us / 600);
+                         m_stats.pace_us / 600, m_stats.ran_ahead);
                 m_stats = {.last_present = entered};
             }
+        }
+        if (Common::Nx2MovieClock::Enabled()) {
+            LogMovieClock(paced);
         }
         constexpr u64 AvailableSlots = 0x7fff;
         TipcReplyWords(ctx, {static_cast<u32>(AvailableSlots),
                              static_cast<u32>(AvailableSlots >> 32), 0, 0, 0, 0});
+    }
+
+    struct MovieClockState {
+        std::chrono::steady_clock::time_point wall{};
+        s64 guest_ns{};
+        u64 presents{};
+        std::array<u64, 12> counts{};
+    };
+    MovieClockState m_movie_clock{};
+
+    void LogMovieClock(std::chrono::steady_clock::time_point now) {
+        auto& c = Common::Nx2MovieClock::Get();
+        const auto load = [](const std::atomic<u64>& v) { return v.load(std::memory_order_relaxed); };
+        const std::array<u64, 12> counts{
+            load(c.video_takes),    load(c.video_releases),   load(c.take_to_release_us),
+            load(c.renderer_updates), load(c.renderer_passes), load(c.voices_dropped),
+            load(c.voice_samples),  load(c.sink_frames[0]),    load(c.sink_padded[0]),
+            load(c.sink_frames[1]), load(c.sink_padded[1]),    0};
+        const s64 guest_ns = system.CoreTiming().GetGlobalTimeNs().count();
+        auto& last = m_movie_clock;
+        ++last.presents;
+        if (last.wall == std::chrono::steady_clock::time_point{}) {
+            last = {now, guest_ns, 0, counts};
+            return;
+        }
+        if (now - last.wall < std::chrono::seconds{1}) {
+            return;
+        }
+        std::array<u64, 12> d{};
+        for (size_t i = 0; i < d.size(); ++i) {
+            d[i] = counts[i] - last.counts[i];
+        }
+        const double wall_ms = std::chrono::duration<double, std::milli>(now - last.wall).count();
+        LOG_INFO(Service,
+                 "Nx2 movie clock: wall {:.1f} ms, guest {:.1f} ms | presents {} | video takes {} "
+                 "releases {} take->release {:.1f} ms, pts {:.3f} s | audio updates {} passes {} "
+                 "dropped {} voice samples {} | sink0 {} ({} padded) sink1 {} ({} padded)",
+                 wall_ms, static_cast<double>(guest_ns - last.guest_ns) / 1e6, last.presents,
+                 d[0], d[1], d[1] ? static_cast<double>(d[2]) / static_cast<double>(d[1]) / 1000.0 : 0.0,
+                 static_cast<double>(load(c.video_last_pts_us)) / 1e6, d[3], d[4], d[5], d[6], d[7],
+                 d[8], d[9], d[10]);
+        last = {now, guest_ns, 0, counts};
     }
 
     // The console's compositor frees a buffer only once its frame's GPU fence has passed, which
@@ -1855,7 +1924,7 @@ private:
     struct PresentStats {
         long long frame_us{}, fence_us{}, composite_us{}, pace_us{}, max_fence_us{};
         long long max_frame_us{}, hitches{};
-        u32 presents{};
+        u32 presents{}, ran_ahead{};
         std::chrono::steady_clock::time_point last_present{};
     } m_stats{};
     u32 m_previous_fence_id{~0U}; // none yet (WaitForFrame ignores ids >= 192)
@@ -1880,7 +1949,8 @@ private:
     // timing: present word 12, (swap interval << 16) | refresh rate. Fire Emblem: Fortune's Weave
     // sends 0x1003c during its boot logos and 0x2003c (two vblanks per frame, 30 fps) after; paced
     // at every vblank it ran at double speed. EDEN_NX2_SWAP_INTERVAL=<n> forces the interval.
-    void PaceToVblank(u32 timing) {
+    void PaceToVblank(u32 timing, const Kernel::KProcess* process) {
+        Common::Nx2Timeline::Span timeline_span{"present: pace to vblank"};
         const bool trace = Common::DkbFrameTrace::Enabled();
         if (trace) {
             if (m_frame_trace.previous_word && *m_frame_trace.previous_word != timing) {
@@ -1898,16 +1968,22 @@ private:
             const char* value = std::getenv("EDEN_NX2_SWAP_INTERVAL");
             return value ? static_cast<u32>(std::strtoul(value, nullptr, 10)) : 0U;
         }();
-        const auto& process = Kernel::GetCurrentProcess(kernel);
         const bool mkw_dynamic =
-            process.GetProgramId() == Settings::MarioKartWorldProgramId &&
-            process.IsMkwDynamicFpsPatchApplied() && Settings::values.mkw_dynamic_fps.GetValue();
+            process != nullptr && process->GetProgramId() == Settings::MarioKartWorldProgramId &&
+            process->IsMkwDynamicFpsPatchApplied() && Settings::values.mkw_dynamic_fps.GetValue();
         u32 swap_interval = std::clamp<u32>(timing >> 16, 1, 4);
         if (mkw_dynamic) {
             swap_interval = 1;
         }
         if (forced_interval != 0) {
             swap_interval = forced_interval;
+        }
+        // Ocarina of Time's 30 FPS mode (lower-end PCs): two vblanks a frame. Its frame step
+        // follows the time measured (Dynamic FPS by Dark), so it keeps full speed.
+        constexpr u64 OcarinaOfTimeId = 0x0400486024DEC000ULL;
+        if (process != nullptr && process->GetProgramId() == OcarinaOfTimeId &&
+            Settings::values.oot_30fps.GetValue()) {
+            swap_interval = (std::max)(swap_interval, 2U);
         }
         const u32 refresh_rate = (timing & 0xffff) >= 30 && (timing & 0xffff) <= 240 ? timing & 0xffff : 60;
         if (trace) {
@@ -1916,22 +1992,41 @@ private:
             m_frame_trace.forced = forced_interval;
         }
         if (!Settings::values.use_speed_limit.GetValue() || Settings::SpeedLimit() == 0) {
+            VideoCommon::Nx2Perf::g_guest_frame_interval_ns.store(0, std::memory_order_relaxed);
             return;
         }
         if (timing != std::exchange(m_swap_word, timing)) {
             LOG_INFO(Service, "nx2:vi2 present #{} swap interval {} at {} Hz (word 12 = {:#x})",
                      m_presents, swap_interval, refresh_rate, timing);
         }
-        const auto interval = std::chrono::nanoseconds{
+        auto interval = std::chrono::nanoseconds{
             100'000'000'000LL * swap_interval / refresh_rate / Settings::SpeedLimit()};
+        // Genlock: with the host frame pacer on, a frame period within 1% of a whole number of
+        // display refreshes becomes exactly that many measured refreshes (a "120 Hz" display at
+        // 119.98 Hz: 33.3389 ms instead of 33.3333). On the game's own clock its frames drifted
+        // against the display and missed their refresh about once a minute (a 41 ms frame, then
+        // a short one). The game runs at most 1% slower.
+        if (const long long host_refresh =
+                VideoCommon::Nx2Perf::g_host_refresh_ns.load(std::memory_order_relaxed);
+            host_refresh > 0) {
+            const long long refreshes =
+                (interval.count() + host_refresh / 2) / host_refresh;
+            const long long locked = refreshes * host_refresh;
+            if (refreshes >= 1 && std::abs(locked - interval.count()) * 100 < interval.count()) {
+                interval = std::chrono::nanoseconds{locked};
+            }
+        }
+        VideoCommon::Nx2Perf::g_guest_frame_interval_ns.store(interval.count(),
+                                                              std::memory_order_relaxed);
         if (trace) {
             m_frame_trace.target_ms = std::chrono::duration<double, std::milli>(interval).count();
         }
         const auto now = std::chrono::steady_clock::now();
-        const auto pacing = m_present_pacer.Advance(now, interval);
+        auto pacing = m_present_pacer.Advance(now, interval);
         if (trace) {
             m_frame_trace.deadline_reset = pacing.reset;
         }
+        AlignPhaseToDisplay(interval, now, pacing.deadline);
         if (now < pacing.deadline) {
             // Sleep this service thread in the guest kernel. It runs on guest core 3, and a host
             // sleep held that core for the whole wait: game threads scheduled there ran only
@@ -1951,10 +2046,78 @@ private:
         }
     }
 
+    // At 30 FPS and below the host frame pacer (vk_host_pacer.h) presents frames as soon as they
+    // are rendered. Move this game's frames (at most 0.5 ms a frame, later only while it sleeps
+    // here anyway) until each is ready ~6 ms before a display refresh: it is shown at that
+    // refresh, evenly spaced (genlock keeps the phase), with little wait. If moving them stops
+    // bringing them closer, leave the phase alone for a minute (an earlier version, steered by
+    // the time frames were held, held 60 FPS at 57-58).
+    void AlignPhaseToDisplay(std::chrono::nanoseconds interval,
+                             std::chrono::steady_clock::time_point now,
+                             std::chrono::steady_clock::time_point& deadline) {
+        using namespace std::chrono_literals;
+        const long long ahead =
+            VideoCommon::Nx2Perf::g_host_phase_ns.load(std::memory_order_relaxed);
+        const long long refresh =
+            VideoCommon::Nx2Perf::g_host_refresh_ns.load(std::memory_order_relaxed);
+        // Only on displays whose refresh divides the frame period (60/120/240 Hz for 30 FPS):
+        // on 75/144/165 Hz the frames land on a different phase each time and there is no
+        // single phase to aim for.
+        const long long refreshes = refresh > 0 ? (interval.count() + refresh / 2) / refresh : 0;
+        if (interval < 25ms || ahead < 0 || refresh <= 0 ||
+            std::abs(refreshes * refresh - interval.count()) * 100 > interval.count()) {
+            m_phase = {};
+            return;
+        }
+        // Positive: ready too early (waits for the refresh); negative: too close to it (a
+        // little jitter moves it to the next one).
+        double error = static_cast<double>(ahead) - 6e6;
+        if (error > static_cast<double>(refresh) / 2) {
+            error -= static_cast<double>(refresh);
+        }
+        m_phase.error_ema += (error - m_phase.error_ema) * 0.2;
+        if (m_phase.frames == 0) {
+            m_phase.error_ema = m_phase.window_error = error;
+        }
+        if (++m_phase.frames % 60 == 0) {
+            if (m_phase.window_shift > 3e6 && std::abs(m_phase.error_ema) > 2e6 &&
+                std::abs(m_phase.error_ema) > std::abs(m_phase.window_error) - 1e6) {
+                m_phase.backoff = 1800;
+                LOG_INFO(Service, "nx2:vi2 frame phase: moving frames {:.1f} ms did not bring them "
+                         "closer to the refreshes ({:.1f} -> {:.1f} ms off); not moving them for 60 s",
+                         m_phase.window_shift / 1e6, m_phase.window_error / 1e6,
+                         m_phase.error_ema / 1e6);
+            }
+            m_phase.window_shift = 0;
+            m_phase.window_error = m_phase.error_ema;
+        }
+        if (m_phase.backoff > 0) {
+            --m_phase.backoff;
+            return;
+        }
+        const double slack = static_cast<double>((deadline - now).count());
+        const double shift =
+            std::clamp(m_phase.error_ema * 0.2, -0.5e6, (std::min)(0.5e6, slack - 2e6));
+        if (std::abs(m_phase.error_ema) > 1e6 && std::abs(shift) > 1e4) {
+            const auto step = std::chrono::nanoseconds{static_cast<s64>(shift)};
+            m_present_pacer.Shift(step);
+            deadline += step;
+            m_phase.window_shift += std::abs(shift);
+        }
+    }
+    struct PhaseAlign {
+        double error_ema{};
+        double window_shift{};
+        double window_error{};
+        u64 frames{};
+        u32 backoff{};
+    } m_phase;
+
     /// Waits until the fence is reached. With `unless_gpu_waits`, gives up after a few ms once a
     /// GPU channel was seen suspended on a semaphore (it may be one this thread releases later).
     /// Returns whether the fence was reached.
     bool WaitForFrame(u32 fence_id, u32 fence_value, bool unless_gpu_waits = false) {
+        Common::Nx2Timeline::Span timeline_span{"present: wait for frame fence"};
         if (fence_id >= 192) {
             return true;
         }
@@ -2019,6 +2182,7 @@ private:
     // shown_size: the present's word 7, ((height - 1) << 16) | (width - 1) of the area the game drew
     // into from the image's top-left corner (0 when it gives none).
     void Composite(u32 image_id, u32 fence_id, u32 fence_value, u32 shown_size) {
+        Common::Nx2Timeline::Span timeline_span{"present: composite"};
         u64 address{};
         u32 parent{};
         u64 parent_offset{};
@@ -2588,6 +2752,37 @@ private:
         u32 value;
     };
 
+    // Ocarina shows one movie frame per game frame: skip late ones on a real clock (m_mutex held).
+    static constexpr u64 OcarinaOfTimeMovieProgramId = 0x0400486024DEC000ULL;
+    static constexpr auto MovieClockPause = std::chrono::seconds{1};
+
+    bool SyncsToClock() {
+        return system.GetApplicationProcessProgramID() == OcarinaOfTimeMovieProgramId;
+    }
+
+    bool IsLate(u64 pts) const {
+        if (!m_clock_running) {
+            return false;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (now - m_clock_last_take > MovieClockPause) {
+            return false;
+        }
+        const auto elapsed =
+            std::chrono::duration_cast<std::chrono::microseconds>(now - m_clock_start).count();
+        const u64 due = m_clock_start_pts + static_cast<u64>((std::max<s64>)(elapsed, 0));
+        return pts + 2 * m_frame_us < due;
+    }
+
+    void EndMovieClock() {
+        if (m_late_dropped != 0) {
+            LOG_INFO(Service, "{} skipped {} late frames to keep the movie in time",
+                     GetServiceName(), m_late_dropped);
+        }
+        m_late_dropped = 0;
+        m_clock_running = false;
+    }
+
     static constexpr u32 NoSyncpoint = ~0U;
     static constexpr size_t MaxDecodedAhead = 2; // decoded frames held while no image is free
     static constexpr u32 HostSyncpoints = 192;   // Tegra::Host1x::SyncpointManager
@@ -2673,6 +2868,8 @@ private:
             m_codec = std::move(codec);
             m_width = w[5];
             m_height = w[6];
+            m_frame_us = w[7] != 0 && w[7] <= 240 ? u64{1'000'000} / w[7] : u64{1'000'000} / 60;
+            m_clock_running = false;
         }
         if (!m_worker.joinable()) {
             m_worker = std::thread{[this] { DecodeLoop(); }};
@@ -2765,6 +2962,17 @@ private:
     void ReleaseBuffer(HLERequestContext& ctx) {
         const auto* w = ctx.CommandBuffer();
         Log(ctx, "release output");
+        if (const auto taken = m_take_times.find(w[2]);
+            Common::Nx2MovieClock::Enabled() && taken != m_take_times.end()) {
+            auto& clock = Common::Nx2MovieClock::Get();
+            Common::Nx2MovieClock::Add(clock.video_releases, 1);
+            Common::Nx2MovieClock::Add(
+                clock.take_to_release_us,
+                static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                     std::chrono::steady_clock::now() - taken->second)
+                                     .count()));
+            m_take_times.erase(taken);
+        }
         const auto handle = HandOut(w[2], Fence{~w[4], w[6]});
         TipcReplyWords(ctx, {handle[0], handle[1], handle[2], handle[3]});
     }
@@ -2858,6 +3066,7 @@ private:
                          m_decoded_frames, m_frames_out, m_stream_ended, m_end_queued);
             }
             CompleteHandedFences();
+            EndMovieClock();
         }
         TipcReplyWords(ctx, {});
     }
@@ -2888,6 +3097,11 @@ private:
             if (!m_outputs.empty()) {
                 output = m_outputs.front();
                 m_outputs.pop_front();
+                const auto now = std::chrono::steady_clock::now();
+                if (m_clock_running && now - m_clock_last_take > MovieClockPause) {
+                    m_clock_start += now - m_clock_last_take;
+                }
+                m_clock_last_take = now;
             }
         }
         if (!output) {
@@ -2899,6 +3113,12 @@ private:
             IPC::ResponseBuilder rb{ctx, 2};
             rb.PushRaw<u32>(0x1c286f);
             return;
+        }
+        if (Common::Nx2MovieClock::Enabled()) {
+            auto& clock = Common::Nx2MovieClock::Get();
+            Common::Nx2MovieClock::Add(clock.video_takes, 1);
+            clock.video_last_pts_us.store(output->pts, std::memory_order_relaxed);
+            m_take_times[output->image] = std::chrono::steady_clock::now();
         }
         const u64 pts_ns = output->pts * 1000;
         if (Nx2VideoTraceEnabled()) {
@@ -2931,6 +3151,7 @@ private:
             if (m_flush) {
                 m_flush = false;
                 m_decoded.clear();
+                EndMovieClock();
                 if (decoder) {
                     lk.unlock();
                     decoder->Reset();
@@ -2939,8 +3160,19 @@ private:
                 continue;
             }
             if (!m_decoded.empty() && !m_free.empty()) {
+                while (m_decoded.size() > 1 && !m_decoded.front().end &&
+                       IsLate(m_decoded.front().pts)) {
+                    m_decoded.pop_front();
+                    ++m_late_dropped;
+                }
                 Decoded frame = std::move(m_decoded.front());
                 m_decoded.pop_front();
+                if (!m_clock_running && frame.picture && !frame.end && SyncsToClock()) {
+                    m_clock_running = true;
+                    m_clock_start = std::chrono::steady_clock::now();
+                    m_clock_last_take = m_clock_start;
+                    m_clock_start_pts = frame.pts;
+                }
                 const u32 image = m_free.front();
                 m_free.pop_front();
                 std::optional<Fence> fence;
@@ -2960,6 +3192,7 @@ private:
                     m_stream_ended = true;
                     m_end_queued = false;
                     m_ready->room.store(false, std::memory_order_relaxed);
+                    EndMovieClock();
                 }
                 system.Host1x().GetSyncpointManager().IncrementGuest(m_syncpoint);
                 m_last_output = m_outputs.back();
@@ -3015,9 +3248,22 @@ private:
             if (m_flush) {
                 continue;
             }
-            for (auto& picture : pictures) {
-                const u64 pts = picture.pts;
-                m_decoded.push_back({std::move(picture), pts, false});
+            for (size_t i = 0; i < pictures.size(); ++i) {
+                const u64 pts = pictures[i].pts;
+                if (IsLate(pts)) {
+                    const bool last = input.end && i + 1 == pictures.size();
+                    const bool newer_follows = i + 1 < pictures.size() || !m_inputs.Empty();
+                    if (!last && newer_follows) {
+                        ++m_late_dropped;
+                        continue;
+                    }
+                    while (!m_decoded.empty() && !m_decoded.back().end &&
+                           IsLate(m_decoded.back().pts)) {
+                        m_decoded.pop_back();
+                        ++m_late_dropped;
+                    }
+                }
+                m_decoded.push_back({std::move(pictures[i]), pts, false});
             }
             if (input.end) {
                 // The client stops at the frame marked end of stream; give it one even when the
@@ -3216,6 +3462,13 @@ private:
     bool m_end_queued{};
     bool m_flush{};
     bool m_quit{};
+    std::map<u32, std::chrono::steady_clock::time_point> m_take_times;
+    u64 m_frame_us{1'000'000 / 60};
+    bool m_clock_running{};
+    std::chrono::steady_clock::time_point m_clock_start{};
+    std::chrono::steady_clock::time_point m_clock_last_take{};
+    u64 m_clock_start_pts{};
+    u64 m_late_dropped{};
     std::thread m_worker;
 };
 
