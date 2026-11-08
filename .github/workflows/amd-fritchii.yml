@@ -78,6 +78,9 @@ jobs:
           sed -i '/\/we445[6-9] /d' src/CMakeLists.txt
           sed -i 's/option(ENABLE_WERROR "Enable -Werror diagnostics" ON)/option(ENABLE_WERROR "Enable -Werror diagnostics" OFF)/' CMakeLists.txt
           git commit -q -am "build: no tratar avisos como errores (Fritchii v4.1 no compila con ellos en este CI)"
+          # vk_host_pacer.cpp pide dwmapi con #pragma comment, que MinGW ignora: eden-cli no enlazaba en PGO.
+          printf '\nif (WIN32)\n    target_link_libraries(video_core PRIVATE dwmapi)\nendif()\n' >> src/video_core/CMakeLists.txt
+          git commit -q -am "build: enlazar dwmapi en video_core (MinGW ignora el #pragma comment de vk_host_pacer)"
 
           git log --oneline "$BASE"..HEAD | cat
           echo "tree $(git rev-parse HEAD^{tree})"
