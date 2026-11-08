@@ -1,0 +1,92 @@
+name: amd-fritchii
+
+# Lichii para AMD (RX 9060 XT) sobre Frizti/Fritchii fritchii-v4.1 + zortos293/Lichii #353 y #251,
+# y lanza release-binaries (solo Windows) sobre la rama amd-fritchii.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  construir:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Descargar codigo
+        uses: actions/checkout@v5
+        with:
+          ref: nx2
+          fetch-depth: 0
+
+      - name: Aplicar receta
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "martiportog16"
+          git config user.email "283288338+martiportog16@users.noreply.github.com"
+          cat > /tmp/receta.sh <<'RECETA'
+          #!/bin/bash
+          # Lichii para AMD (RX 9060 XT) sobre Frizti/Fritchii fritchii-v4.1, con:
+          #   zortos293/Lichii#353 - raya violeta en el cielo (no escribir componentes que el shader no saca)
+          #   zortos293/Lichii#251 - cinematicas sincronizadas con el audio por debajo de 60 fps
+          # Fritchii ya trae #351 (version completa de #292), #432, #440, #463, #446 y #354.
+          # Uso: receta_fritchii.sh <url-zortos293-Lichii> <url-Frizti-Fritchii>
+          set -euo pipefail
+          UP="$1"
+          FR="$2"
+          BASE=f6d42b87150678e001dbeb84679a9595935ce951
+          PR_BASE=9fa4a71fa051aa857e2d8f370aa31739a4f062c2
+          P353=fc731789dcc276f55e1d85e1ad81c32628e6b705
+          P251=e965abdde60de440fd03d5be2c5288faa5afe04d
+
+          git fetch -q --no-tags "$FR" "$BASE"
+          git fetch -q --no-tags "$UP" "$PR_BASE" "$P353" "$P251"
+          git checkout -q -B variante "$BASE"
+
+          echo "::group::#251"
+          for c in $(git rev-list --reverse --no-merges "$(git merge-base "$PR_BASE" "$P251")..$P251"); do
+            echo "-- $(git log -1 --format='%h %s' "$c")"
+            git cherry-pick -x "$c" >/dev/null
+          done
+          echo "::endgroup::"
+
+          echo "::group::#353"
+          git diff "$(git merge-base "$PR_BASE" "$P353")" "$P353" > /tmp/pr353.diff
+          git apply -3 /tmp/pr353.diff || true
+          python3 - <<'PY'
+          import re
+          # Los dos lados solo anaden miembros distintos en el mismo sitio: se conservan ambos.
+          for p in ["src/video_core/renderer_vulkan/vk_graphics_pipeline.h",
+                    "src/video_core/renderer_vulkan/vk_rasterizer.h"]:
+              s = open(p, encoding="utf-8").read()
+              def both(m):
+                  ours, theirs = m.group(1), m.group(2)
+                  if "FragmentCanDiscard" in ours:
+                      return ours + "    }\n\n" + theirs
+                  return ours + theirs
+              s = re.sub(r"<<<<<<< ours\n(.*?)=======\n(.*?)>>>>>>> theirs\n", both, s, flags=re.S)
+              open(p, "w", encoding="utf-8").write(s)
+          PY
+          if grep -rlq '^<<<<<<< \|^>>>>>>> ' src/; then echo "::error::quedan marcas de conflicto"; exit 1; fi
+          git add -A
+          git commit -q -m "vulkan: don't write render target components the fragment shader doesn't output (zortos293/Lichii#353, jpkto)"
+          echo "::endgroup::"
+
+          git log --oneline "$BASE"..HEAD | cat
+          echo "tree $(git rev-parse HEAD^{tree})"
+          RECETA
+          bash /tmp/receta.sh https://github.com/zortos293/Lichii.git https://github.com/Frizti/Fritchii.git
+          # El token del flujo no puede subir cambios en .github/workflows: se junta todo en un
+          # commit sobre nx2 que conserva los flujos de este repo.
+          git reset -q --soft origin/nx2
+          git rm -rq --cached .github
+          rm -rf .github
+          git checkout origin/nx2 -- .github
+          git commit -q -m "Lichii AMD sobre Fritchii v4.1 + #353 + #251 (ver amd-fritchii.yml)"
+          git push -f origin HEAD:refs/heads/amd-fritchii
+
+      - name: Lanzar compilacion
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run release-binaries.yml --repo "$GITHUB_REPOSITORY" --ref amd-fritchii -f publish_release=true
