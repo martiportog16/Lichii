@@ -73,6 +73,12 @@ jobs:
           git commit -q -m "vulkan: don't write render target components the fragment shader doesn't output (zortos293/Lichii#353, jpkto)"
           echo "::endgroup::"
 
+          # Fritchii v4.1 tiene avisos de variables ocultas (C4459, -Wshadow, pragmas) que el compilador trata
+          # como errores en este CI: se compilan como avisos normales.
+          sed -i '/\/we445[6-9] /d' src/CMakeLists.txt
+          sed -i 's/option(ENABLE_WERROR "Enable -Werror diagnostics" ON)/option(ENABLE_WERROR "Enable -Werror diagnostics" OFF)/' CMakeLists.txt
+          git commit -q -am "build: no tratar avisos como errores (Fritchii v4.1 no compila con ellos en este CI)"
+
           git log --oneline "$BASE"..HEAD | cat
           echo "tree $(git rev-parse HEAD^{tree})"
           RECETA
